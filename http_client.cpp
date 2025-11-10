@@ -1,6 +1,7 @@
 #include "http_client.h"
 #include <custom_exception.h>
 #include <utilities.h>
+#include <zlib.h>
 
 void CheckCurl(CURLcode res)
 {
@@ -19,7 +20,7 @@ CURLSH* HTTPClient::curl_share_ = [](){
 
 std::mutex HTTPClient::share_lock_;
 
-void HTTPClient::share_lock_fn(CURL*, curl_lock_data, curl_lock_access, void*) {
+void HTTPClient::share_lock_fn(CURL*, curl_lock_data, curl_lock_access /*access*/, void*) {
     share_lock_.lock();
 }
 
@@ -50,10 +51,11 @@ CURL* HTTPClient::CurlHandlePool::acquire() {
     
     if (total_handles_ < max_size_) {
         ++total_handles_;
+        // Create handle outside the lock would be ideal, but curl_easy_init is fast
         return curl_easy_init();
     }
     
-    // Pool exhausted, create a temporary handle
+    // Pool exhausted, create a temporary handle (not counted in total_handles_)
     return curl_easy_init();
 }
 
@@ -93,30 +95,33 @@ struct ResponseHandler {
     std::string response;
     std::unique_ptr<char[]> large_buffer;
     size_t large_buffer_size = 0;
+    size_t total_size = 0; // Track actual data size
     static constexpr size_t LARGE_RESPONSE_THRESHOLD = 5 * 1024 * 1024; // 5MB threshold
     static constexpr size_t BUFFER_GROWTH_SIZE = 512 * 1024; // 512KB growth increments
 
     void append(const char* data, size_t size) {
-        if (response.size() + size > LARGE_RESPONSE_THRESHOLD) {
+        if (total_size + size > LARGE_RESPONSE_THRESHOLD) {
             if (!large_buffer) {
-                large_buffer_size = response.size() + size + BUFFER_GROWTH_SIZE;
+                large_buffer_size = total_size + size + BUFFER_GROWTH_SIZE;
                 large_buffer = std::make_unique<char[]>(large_buffer_size);
                 std::copy(response.begin(), response.end(), large_buffer.get());
-            } else if (large_buffer_size < response.size() + size) {
-                large_buffer_size = response.size() + size + BUFFER_GROWTH_SIZE;
+            } else if (large_buffer_size < total_size + size) {
+                large_buffer_size = total_size + size + BUFFER_GROWTH_SIZE;
                 auto new_buffer = std::make_unique<char[]>(large_buffer_size);
-                std::copy(large_buffer.get(), large_buffer.get() + response.size(), new_buffer.get());
+                std::copy(large_buffer.get(), large_buffer.get() + total_size, new_buffer.get());
                 large_buffer = std::move(new_buffer);
             }
-            std::copy(data, data + size, large_buffer.get() + response.size());
+            std::copy(data, data + size, large_buffer.get() + total_size);
+            total_size += size;
         } else {
             response.append(data, size);
+            total_size += size;
         }
     }
 
     [[nodiscard]] std::string get_response() const {
         if (large_buffer) {
-            return {large_buffer.get(), response.size()};
+            return {large_buffer.get(), total_size};
         }
         return response;
     }
@@ -139,10 +144,17 @@ static size_t DiscardHeader(char* ptr, size_t size, size_t nmemb, void*) {
     return size * nmemb; // MUST return exactly what was provided
 }
 
-static size_t ReadCallback(char* buffer, size_t size, size_t nitems, std::string* data) {
-    const size_t copy_size = std::min(size * nitems, data->size());
-    std::memcpy(buffer, data->data(), copy_size);
-    data->erase(0, copy_size);
+struct ReadState {
+    std::string data;
+    size_t position = 0;
+};
+
+static size_t ReadCallback(char* buffer, size_t size, size_t nitems, void* userdata) {
+    auto* state = static_cast<ReadState*>(userdata);
+    const size_t remaining = state->data.size() - state->position;
+    const size_t copy_size = std::min(size * nitems, remaining);
+    std::memcpy(buffer, state->data.data() + state->position, copy_size);
+    state->position += copy_size;
     return copy_size;
 }
 
@@ -171,7 +183,7 @@ static bool gunzip(const std::string& in, std::string& out) {
     return true;
 }
 
-static bool inflate(const std::string& in, std::string& out) {
+static bool inflate_data(const std::string& in, std::string& out) {
     z_stream zs{};
     zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(in.data()));
     zs.avail_in = static_cast<uInt>(in.size());
@@ -185,7 +197,7 @@ static bool inflate(const std::string& in, std::string& out) {
         do {
             zs.next_out = reinterpret_cast<Bytef*>(buf);
             zs.avail_out = sizeof(buf);
-            rc = inflate(&zs, Z_NO_FLUSH);
+            rc = ::inflate(&zs, Z_NO_FLUSH);
             if (rc != Z_OK && rc != Z_STREAM_END) {
                 success = false;
                 break;
@@ -215,7 +227,7 @@ static bool inflate(const std::string& in, std::string& out) {
     do {
         zs.next_out = reinterpret_cast<Bytef*>(buf);
         zs.avail_out = sizeof(buf);
-        rc = inflate(&zs, Z_NO_FLUSH);
+        rc = ::inflate(&zs, Z_NO_FLUSH);
         if (rc != Z_OK && rc != Z_STREAM_END) {
             inflateEnd(&zs);
             return false;
@@ -385,7 +397,7 @@ HTTPClient::Result HTTPClient::SendRequest(HttpMethod method,
                 if (is_gzip_encoded) {
                     decompress_success = gunzip(result.response_body, decoded);
                 } else if (is_deflate_encoded) {
-                    decompress_success = inflate(result.response_body, decoded);
+                    decompress_success = inflate_data(result.response_body, decoded);
                 }
 
                 if (decompress_success) {
@@ -415,10 +427,14 @@ void HTTPClient::ConfigurePost(CURL* curl, const std::string& data) {
 }
 
 void HTTPClient::ConfigurePut(CURL* curl, const std::string& data) {
+    static thread_local ReadState read_state;
+    read_state.data = data;
+    read_state.position = 0;
+    
     CheckCurl(curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L));
     CheckCurl(curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(data.size())));
     CheckCurl(curl_easy_setopt(curl, CURLOPT_READFUNCTION, ReadCallback));
-    CheckCurl(curl_easy_setopt(curl, CURLOPT_READDATA, &data));
+    CheckCurl(curl_easy_setopt(curl, CURLOPT_READDATA, &read_state));
 }
 
 void HTTPClient::ConfigureDelete(CURL* curl, const std::string& data) {
@@ -430,7 +446,6 @@ void HTTPClient::ConfigureDelete(CURL* curl, const std::string& data) {
 }
 
 void HTTPClient::ConfigureGet(CURL* curl) {
-    CheckCurl(curl_easy_setopt(curl, CURLOPT_POST, 1L));
     CheckCurl(curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, nullptr));
     CheckCurl(curl_easy_setopt(curl, CURLOPT_UPLOAD, 0L));
     CheckCurl(curl_easy_setopt(curl, CURLOPT_POST, 0L));
@@ -467,8 +482,13 @@ void HTTPClient::ConfigurePurge(CURL* curl, const std::string& cacheCluster) {
     CheckCurl(curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L));
     CheckCurl(curl_easy_setopt(curl, CURLOPT_DNS_SHUFFLE_ADDRESSES, 1L));
 
-    // Distributed cache headers
-    struct curl_slist* headers = nullptr;
+    // Distributed cache headers - using static thread local to manage memory
+    static thread_local struct curl_slist* headers = nullptr;
+    if (headers) {
+        curl_slist_free_all(headers);
+        headers = nullptr;
+    }
+    
     headers = curl_slist_append(headers, "Cache-Purge: distributed");
     headers = curl_slist_append(headers, ("X-Cache-Cluster: " + cacheCluster).c_str());
 
