@@ -4,6 +4,10 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
 #include <boost/asio.hpp>
 #include <json_utils.h>
 #include <curl/curl.h>
@@ -48,22 +52,7 @@ public:
         bool completeSuccess = false;
     };
 
-    explicit HTTPClient(size_t thread_pool_size = 0);
-
-    void Get(const std::string& url,
-             const std::function<void(Result)>& callback,
-             bool async = true);
-
-
-    void Post(const std::string& url, const nlohmann::json& body,
-              const std::function<void(Result)>& callback,
-              bool async = true,
-              const std::vector<std::string>& headers = {});
-
-    // Sync version
-    static Result GetSync(const std::string& url);
-    static Result PostSync(const std::string& url, const nlohmann::json& body,
-                           const std::vector<std::string>& headers = {});
+    explicit HTTPClient(size_t thread_pool_size = 0, size_t curl_pool_size = 0);
 
     static HTTPClient::Result SendRequest(HttpMethod method,
                                           const std::string& endpoint,
@@ -76,8 +65,28 @@ public:
 
 
 private:
+    // CURL handle pool for reuse
+    class CurlHandlePool {
+    public:
+        explicit CurlHandlePool(size_t max_size);
+        ~CurlHandlePool();
+        CURL* acquire();
+        void release(CURL* handle);
+    private:
+        std::mutex mutex_;
+        std::queue<CURL*> available_handles_;
+        std::atomic<size_t> total_handles_{0};
+        size_t max_size_;
+    };
+
     std::unique_ptr<boost::asio::thread_pool> pool_;
+    std::unique_ptr<CurlHandlePool> curl_pool_;
     static CURLSH* curl_share_;
+    static std::mutex share_lock_;
+    
+    static void share_lock_fn(CURL* handle, curl_lock_data data, curl_lock_access access, void* userptr);
+    static void share_unlock_fn(CURL* handle, curl_lock_data data, void* userptr);
+    
     static void ConfigurePost(CURL* curl, const std::string& data);
     static void ConfigurePut(CURL* curl, const std::string& data);
     static void ConfigureDelete(CURL* curl, const std::string& data);

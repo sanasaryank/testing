@@ -11,13 +11,75 @@ CURLSH* HTTPClient::curl_share_ = [](){
     CURLSH* share = curl_share_init();
     curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
     curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+    curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+    curl_share_setopt(share, CURLSHOPT_LOCKFUNC, HTTPClient::share_lock_fn);
+    curl_share_setopt(share, CURLSHOPT_UNLOCKFUNC, HTTPClient::share_unlock_fn);
     return share;
 }();
 
-HTTPClient::HTTPClient(size_t thread_pool_size) {
-    const size_t default_size = std::thread::hardware_concurrency() * 2;
+std::mutex HTTPClient::share_lock_;
+
+void HTTPClient::share_lock_fn(CURL*, curl_lock_data, curl_lock_access, void*) {
+    share_lock_.lock();
+}
+
+void HTTPClient::share_unlock_fn(CURL*, curl_lock_data, void*) {
+    share_lock_.unlock();
+}
+
+// CURL Handle Pool Implementation
+HTTPClient::CurlHandlePool::CurlHandlePool(size_t max_size) : max_size_(max_size) {}
+
+HTTPClient::CurlHandlePool::~CurlHandlePool() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    while (!available_handles_.empty()) {
+        curl_easy_cleanup(available_handles_.front());
+        available_handles_.pop();
+    }
+}
+
+CURL* HTTPClient::CurlHandlePool::acquire() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    if (!available_handles_.empty()) {
+        CURL* handle = available_handles_.front();
+        available_handles_.pop();
+        curl_easy_reset(handle);
+        return handle;
+    }
+    
+    if (total_handles_ < max_size_) {
+        ++total_handles_;
+        return curl_easy_init();
+    }
+    
+    // Pool exhausted, create a temporary handle
+    return curl_easy_init();
+}
+
+void HTTPClient::CurlHandlePool::release(CURL* handle) {
+    if (!handle) return;
+    
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    if (available_handles_.size() < max_size_) {
+        available_handles_.push(handle);
+    } else {
+        curl_easy_cleanup(handle);
+        if (total_handles_ > 0) --total_handles_;
+    }
+}
+
+HTTPClient::HTTPClient(size_t thread_pool_size, size_t curl_pool_size) {
+    const size_t default_thread_size = std::thread::hardware_concurrency() * 2;
+    const size_t default_curl_pool = std::thread::hardware_concurrency() * 4;
+    
     pool_ = std::make_unique<boost::asio::thread_pool>(
-            thread_pool_size ? thread_pool_size : default_size
+            thread_pool_size ? thread_pool_size : default_thread_size
+    );
+    
+    curl_pool_ = std::make_unique<CurlHandlePool>(
+            curl_pool_size ? curl_pool_size : default_curl_pool
     );
 }
 
@@ -31,15 +93,17 @@ struct ResponseHandler {
     std::string response;
     std::unique_ptr<char[]> large_buffer;
     size_t large_buffer_size = 0;
+    static constexpr size_t LARGE_RESPONSE_THRESHOLD = 5 * 1024 * 1024; // 5MB threshold
+    static constexpr size_t BUFFER_GROWTH_SIZE = 512 * 1024; // 512KB growth increments
 
     void append(const char* data, size_t size) {
-        if (response.size() + size > 10 * 1024 * 1024) { // Switch to heap for large responses
+        if (response.size() + size > LARGE_RESPONSE_THRESHOLD) {
             if (!large_buffer) {
-                large_buffer_size = response.size() + size + 1024 * 1024; // Extra 1MB
+                large_buffer_size = response.size() + size + BUFFER_GROWTH_SIZE;
                 large_buffer = std::make_unique<char[]>(large_buffer_size);
                 std::copy(response.begin(), response.end(), large_buffer.get());
             } else if (large_buffer_size < response.size() + size) {
-                large_buffer_size = response.size() + size + 1024 * 1024; // Extra 1MB
+                large_buffer_size = response.size() + size + BUFFER_GROWTH_SIZE;
                 auto new_buffer = std::make_unique<char[]>(large_buffer_size);
                 std::copy(large_buffer.get(), large_buffer.get() + response.size(), new_buffer.get());
                 large_buffer = std::move(new_buffer);
@@ -82,137 +146,6 @@ static size_t ReadCallback(char* buffer, size_t size, size_t nitems, std::string
     return copy_size;
 }
 
-HTTPClient::Result HTTPClient::GetSync(const std::string& url) {
-    static CurlGlobal global_init;
-
-    CURL* curl = curl_easy_init();
-    if(!curl) return {0, url, "", CURLE_FAILED_INIT};
-
-    std::string response;
-    long http_status = 0;
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-    // Security settings
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-
-    // Performance settings
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(curl, CURLOPT_SHARE, curl_share_);
-
-    CURLcode res = curl_easy_perform(curl);
-
-    if(res == CURLE_OK) {
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
-    }
-
-    curl_easy_cleanup(curl);
-
-    return {http_status, url, response, res, ""};
-}
-
-void HTTPClient::Get(const std::string& url,
-                     const std::function<void(Result)>& callback,
-                     bool async) {
-    auto task = [url, callback]() {
-        callback(GetSync(url));
-    };
-
-    if(async) {
-        boost::asio::post(*pool_, task);
-    } else {
-        task();
-    }
-}
-
-// http_client.cpp implementations
-HTTPClient::Result HTTPClient::PostSync(const std::string& url,
-                                        const nlohmann::json& body,
-                                        const std::vector<std::string>& headers) {
-    static CurlGlobal global_init;
-    CURL* curl = curl_easy_init();
-    if(!curl) return {0, url, "", CURLE_FAILED_INIT, ""};
-
-    std::string response;
-    long http_status = 0;
-    CURLcode res = CURLE_OK;
-    struct curl_slist* header_list = nullptr;
-    std::unique_ptr<struct curl_slist, decltype(&curl_slist_free_all)>
-            headers_guard(header_list, curl_slist_free_all);
-
-    try {
-        // Set common options
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-        // Security settings
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-
-        // POST specific configuration
-        std::string post_data("{}");
-        try {
-            if(nullptr != body) post_data = body.dump();
-        }
-        catch (...) {
-            throw ExceptionType::ApplicationError("Json parsing error!");
-        }
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, post_data.size());
-
-        // Add headers
-        header_list = curl_slist_append(header_list, "Content-Type: application/json");
-        for(const auto& h : headers) {
-            header_list = curl_slist_append(header_list, h.c_str());
-        }
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
-
-        // Performance settings
-        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-        curl_easy_setopt(curl, CURLOPT_SHARE, curl_share_);
-
-        // Execute request
-        res = curl_easy_perform(curl);
-
-        if(res == CURLE_OK) {
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
-        }
-
-    } catch(const std::exception& e) {
-        return {0, url, "", CURLE_OK, e.what()};
-    } catch(...) {
-        return {0, url, "", CURLE_OK, "Unknown exception"};
-    }
-
-    curl_easy_cleanup(curl);
-    return {http_status, url, response, res, ""};
-}
-
-void HTTPClient::Post(const std::string& url, const nlohmann::json& body,
-                      const std::function<void(Result)>& callback,
-                      bool async,
-                      const std::vector<std::string>& headers)
-{
-    auto task = [url, body, headers, callback]() {
-        try {
-            auto result = PostSync(url, body, headers);
-            callback(result);
-        } catch(...) {
-            callback({0, url, "", CURLE_OK, "Unknown exception"});
-        }
-    };
-
-    if(async) {
-        boost::asio::post(*pool_, task);
-    } else {
-        task();
-    }
-}
 bool IsSecure(const std::string& endpoint)
 {
     return endpoint.find("https:")!= std::string::npos;
@@ -294,123 +227,6 @@ static bool inflate(const std::string& in, std::string& out) {
     return true;
 }
 
-//HTTPClient::Result HTTPClient::SendRequest(HttpMethod method,
-//                                           const std::string& endpoint,
-//                                           const std::vector<std::string>& path,
-//                                           const std::string& data,
-//                                           const std::vector<std::string>& headers,
-//                                           const std::vector<std::pair<std::string, std::string>>& query,
-//                                           bool reuse_connection,
-//                                           const std::string& socket_path) noexcept
-//{
-//    Result result;
-//    CURL* curl = curl_easy_init();
-//    if (!curl) {
-//        result.curl_code = CURLE_FAILED_INIT;
-//        result.error_message = "CURL initialization failed";
-//        result.uri = endpoint;
-//        return result;
-//    }
-//    if(!socket_path.empty()) curl_easy_setopt(curl, CURLOPT_UNIX_SOCKET_PATH, socket_path.c_str());
-//
-//    // RAII wrappers for automatic cleanup
-//    std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl_guard(curl, curl_easy_cleanup);
-//    std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> header_list(nullptr, curl_slist_free_all);
-//
-//    try {
-//        // Build and validate URL
-//        const std::string url = Utilities::BuildPath(endpoint, path, query);
-//        if (url.empty()) {
-//            throw std::invalid_argument("Invalid URL constructed");
-//        }
-//        result.uri = url;
-//
-//        // Common curl setup
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_URL, url.c_str()));
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback));
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, DiscardHeader));
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_HEADERDATA, nullptr));
-//        ResponseHandler response_handler;
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_handler));
-//
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, ""));
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_HTTP_CONTENT_DECODING, 0L)); // auto-decode
-//
-//
-//        // Security settings
-//        if(IsSecure(endpoint)) {
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L));
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L));
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_CAINFO, "/etc/ssl/certs/ca-certificates.crt"));
-//        }
-//
-//        // Connection reuse
-//        if(reuse_connection) {
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L));
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L));
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L));
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 0L));
-//        }
-//
-//        // Set headers
-//        if (!headers.empty()) {
-//            struct curl_slist* list = nullptr;
-//            for (const auto& h : headers) {
-//                list = curl_slist_append(list, h.c_str());
-//            }
-//            header_list.reset(list);
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list));
-//        }
-//
-//        // Method-specific configuration
-//        switch (method) {
-//            case HttpMethod::POST:
-//                ConfigurePost(curl, data);
-//                break;
-//            case HttpMethod::PUT:
-//                ConfigurePut(curl, data);
-//                break;
-//            case HttpMethod::DELETE:
-//                ConfigureDelete(curl, data);
-//                break;
-//            case HttpMethod::PATCH:
-//                ConfigurePatch(curl, data);
-//                break;
-//            default:
-//                ConfigureGet(curl);
-//        }
-//        // Timeouts
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 10000L));
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L));
-//
-//        char errbuf[CURL_ERROR_SIZE] = {0};
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf));
-//
-//        // Execute request
-//        result.curl_code = curl_easy_perform(curl);
-//        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.http_status);
-//        result.response_body = response_handler.get_response();
-//        if (result.curl_code != CURLE_OK) {
-//            result.error_message = errbuf[0] ? errbuf : curl_easy_strerror(result.curl_code);
-//        }
-//        else if(200 == result.http_status) {
-//            std::string decoded;
-//            if(gunzip(result.response_body, decoded))
-//                result.response_body = decoded;
-//        }
-//        // Get HTTP status code
-//
-//    } catch (const CurlException& e) {
-//        result.curl_code = e.getErrorCode();
-//        result.error_message = e.what();
-//    } catch (const std::exception& e) {
-//        result.error_message = e.what();
-//    } catch (...) {
-//        result.error_message = "Unknown exception";
-//    }
-//
-//    return result;
-//}
 HTTPClient::Result HTTPClient::SendRequest(HttpMethod method,
                                            const std::string& endpoint,
                                            const std::vector<std::string>& path,
@@ -500,13 +316,20 @@ HTTPClient::Result HTTPClient::SendRequest(HttpMethod method,
             CheckCurl(curl_easy_setopt(curl, CURLOPT_CAINFO, "/etc/ssl/certs/ca-certificates.crt"));
         }
 
-        // Connection reuse
+        // Connection reuse and performance optimizations
         if(reuse_connection) {
             CheckCurl(curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L));
-            CheckCurl(curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L));
-            CheckCurl(curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L));
+            CheckCurl(curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 60L));
+            CheckCurl(curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L));
             CheckCurl(curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 0L));
         }
+        
+        // Performance optimizations for high-load scenarios
+        CheckCurl(curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 300L)); // 5 minutes
+        CheckCurl(curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L)); // Disable Nagle's algorithm
+        CheckCurl(curl_easy_setopt(curl, CURLOPT_TCP_FASTOPEN, 1L)); // Enable TCP Fast Open
+        CheckCurl(curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS)); // HTTP/2
+        CheckCurl(curl_easy_setopt(curl, CURLOPT_SHARE, curl_share_)); // Share DNS and SSL sessions
 
         // Set headers
         if (!headers.empty()) {
@@ -535,9 +358,9 @@ HTTPClient::Result HTTPClient::SendRequest(HttpMethod method,
             default:
                 ConfigureGet(curl);
         }
-        // Timeouts
-        CheckCurl(curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 10000L));
-        CheckCurl(curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L));
+        // Optimized timeouts for high-load scenarios
+        CheckCurl(curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 30000L)); // 30 seconds total
+        CheckCurl(curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L)); // 10 seconds connect
 
         char errbuf[CURL_ERROR_SIZE] = {0};
         CheckCurl(curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf));
