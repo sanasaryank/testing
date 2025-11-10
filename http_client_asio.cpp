@@ -26,19 +26,6 @@ AsioHttpClient::AsioHttpClient() {
 
 AsioHttpClient::~AsioHttpClient() = default;
 
-AsioHttpClient::AsioHttpClient(AsioHttpClient&& other) noexcept
-    : io_context_(std::move(other.io_context_)),
-      ssl_context_(std::move(other.ssl_context_)) {
-}
-
-AsioHttpClient& AsioHttpClient::operator=(AsioHttpClient&& other) noexcept {
-    if (this != &other) {
-        io_context_ = std::move(other.io_context_);
-        ssl_context_ = std::move(other.ssl_context_);
-    }
-    return *this;
-}
-
 AsioHttpClient::ParsedUrl AsioHttpClient::parse_url(const std::string& url) {
     // Regular expression to parse URL
     // Format: (http|https)://host[:port][/path]

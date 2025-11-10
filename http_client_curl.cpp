@@ -340,7 +340,6 @@ Response CurlHttpClient::request(
             case CURLE_SSL_SHUTDOWN_FAILED:
             case CURLE_SSL_ENGINE_NOTFOUND:
             case CURLE_SSL_ENGINE_SETFAILED:
-            case CURLE_PEER_FAILED_VERIFICATION:
                 throw SslException(error_msg, res);
             
             case CURLE_URL_MALFORMAT:

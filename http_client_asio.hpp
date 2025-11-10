@@ -51,13 +51,11 @@ public:
      */
     ~AsioHttpClient();
     
-    // Non-copyable
+    // Non-copyable and non-moveable (due to io_context restrictions)
     AsioHttpClient(const AsioHttpClient&) = delete;
     AsioHttpClient& operator=(const AsioHttpClient&) = delete;
-    
-    // Moveable
-    AsioHttpClient(AsioHttpClient&& other) noexcept;
-    AsioHttpClient& operator=(AsioHttpClient&& other) noexcept;
+    AsioHttpClient(AsioHttpClient&&) = delete;
+    AsioHttpClient& operator=(AsioHttpClient&&) = delete;
     
     /**
      * Perform an HTTP request

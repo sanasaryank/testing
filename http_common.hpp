@@ -7,6 +7,7 @@
 #include <optional>
 #include <chrono>
 #include <string_view>
+#include <algorithm>
 
 namespace http {
 
