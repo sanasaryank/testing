@@ -33,6 +33,9 @@ void demonstrate_client(const std::string& client_name) {
         config.timeout = std::chrono::seconds(10);
         config.connect_timeout = std::chrono::seconds(5);
         
+        // NOTE: Using HTTP URLs for testing purposes to demonstrate both HTTP and HTTPS support
+        // In production code, always prefer HTTPS for sensitive data
+        
         // Example 1: Simple GET request
         std::cout << "\n--- Example 1: Simple GET request ---\n";
         try {
