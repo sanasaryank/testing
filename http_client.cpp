@@ -446,6 +446,7 @@ void HTTPClient::ConfigureDelete(CURL* curl, const std::string& data) {
 }
 
 void HTTPClient::ConfigureGet(CURL* curl) {
+    CheckCurl(curl_easy_setopt(curl, CURLOPT_POST, 1L));
     CheckCurl(curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, nullptr));
     CheckCurl(curl_easy_setopt(curl, CURLOPT_UPLOAD, 0L));
     CheckCurl(curl_easy_setopt(curl, CURLOPT_POST, 0L));
