@@ -54,16 +54,6 @@ public:
 
     explicit HTTPClient(size_t thread_pool_size = 0, size_t curl_pool_size = 0);
 
-    void Get(const std::string& url,
-             const std::function<void(Result)>& callback,
-             bool async = true);
-
-
-    void Post(const std::string& url, const nlohmann::json& body,
-              const std::function<void(Result)>& callback,
-              bool async = true,
-              const std::vector<std::string>& headers = {});
-
     static HTTPClient::Result SendRequest(HttpMethod method,
                                           const std::string& endpoint,
                                           const std::vector<std::string>& path,
