@@ -294,123 +294,6 @@ static bool inflate(const std::string& in, std::string& out) {
     return true;
 }
 
-//HTTPClient::Result HTTPClient::SendRequest(HttpMethod method,
-//                                           const std::string& endpoint,
-//                                           const std::vector<std::string>& path,
-//                                           const std::string& data,
-//                                           const std::vector<std::string>& headers,
-//                                           const std::vector<std::pair<std::string, std::string>>& query,
-//                                           bool reuse_connection,
-//                                           const std::string& socket_path) noexcept
-//{
-//    Result result;
-//    CURL* curl = curl_easy_init();
-//    if (!curl) {
-//        result.curl_code = CURLE_FAILED_INIT;
-//        result.error_message = "CURL initialization failed";
-//        result.uri = endpoint;
-//        return result;
-//    }
-//    if(!socket_path.empty()) curl_easy_setopt(curl, CURLOPT_UNIX_SOCKET_PATH, socket_path.c_str());
-//
-//    // RAII wrappers for automatic cleanup
-//    std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl_guard(curl, curl_easy_cleanup);
-//    std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> header_list(nullptr, curl_slist_free_all);
-//
-//    try {
-//        // Build and validate URL
-//        const std::string url = Utilities::BuildPath(endpoint, path, query);
-//        if (url.empty()) {
-//            throw std::invalid_argument("Invalid URL constructed");
-//        }
-//        result.uri = url;
-//
-//        // Common curl setup
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_URL, url.c_str()));
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback));
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, DiscardHeader));
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_HEADERDATA, nullptr));
-//        ResponseHandler response_handler;
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_handler));
-//
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, ""));
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_HTTP_CONTENT_DECODING, 0L)); // auto-decode
-//
-//
-//        // Security settings
-//        if(IsSecure(endpoint)) {
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L));
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L));
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_CAINFO, "/etc/ssl/certs/ca-certificates.crt"));
-//        }
-//
-//        // Connection reuse
-//        if(reuse_connection) {
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L));
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L));
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L));
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 0L));
-//        }
-//
-//        // Set headers
-//        if (!headers.empty()) {
-//            struct curl_slist* list = nullptr;
-//            for (const auto& h : headers) {
-//                list = curl_slist_append(list, h.c_str());
-//            }
-//            header_list.reset(list);
-//            CheckCurl(curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list));
-//        }
-//
-//        // Method-specific configuration
-//        switch (method) {
-//            case HttpMethod::POST:
-//                ConfigurePost(curl, data);
-//                break;
-//            case HttpMethod::PUT:
-//                ConfigurePut(curl, data);
-//                break;
-//            case HttpMethod::DELETE:
-//                ConfigureDelete(curl, data);
-//                break;
-//            case HttpMethod::PATCH:
-//                ConfigurePatch(curl, data);
-//                break;
-//            default:
-//                ConfigureGet(curl);
-//        }
-//        // Timeouts
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 10000L));
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L));
-//
-//        char errbuf[CURL_ERROR_SIZE] = {0};
-//        CheckCurl(curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf));
-//
-//        // Execute request
-//        result.curl_code = curl_easy_perform(curl);
-//        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.http_status);
-//        result.response_body = response_handler.get_response();
-//        if (result.curl_code != CURLE_OK) {
-//            result.error_message = errbuf[0] ? errbuf : curl_easy_strerror(result.curl_code);
-//        }
-//        else if(200 == result.http_status) {
-//            std::string decoded;
-//            if(gunzip(result.response_body, decoded))
-//                result.response_body = decoded;
-//        }
-//        // Get HTTP status code
-//
-//    } catch (const CurlException& e) {
-//        result.curl_code = e.getErrorCode();
-//        result.error_message = e.what();
-//    } catch (const std::exception& e) {
-//        result.error_message = e.what();
-//    } catch (...) {
-//        result.error_message = "Unknown exception";
-//    }
-//
-//    return result;
-//}
 HTTPClient::Result HTTPClient::SendRequest(HttpMethod method,
                                            const std::string& endpoint,
                                            const std::vector<std::string>& path,
@@ -497,7 +380,6 @@ HTTPClient::Result HTTPClient::SendRequest(HttpMethod method,
         if(IsSecure(endpoint)) {
             CheckCurl(curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L));
             CheckCurl(curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L));
-            CheckCurl(curl_easy_setopt(curl, CURLOPT_CAINFO, "/etc/ssl/certs/ca-certificates.crt"));
         }
 
         // Connection reuse
@@ -572,7 +454,7 @@ HTTPClient::Result HTTPClient::SendRequest(HttpMethod method,
             }
         }
 
-    } catch (const TrioWebException& e) {
+    } catch (const ExceptionType::ApplicationError& e) {
         result.curl_code = (CURLcode)e.Code();
         result.error_message = e.what();
     } catch (const std::exception& e) {
@@ -592,10 +474,9 @@ void HTTPClient::ConfigurePost(CURL* curl, const std::string& data) {
 }
 
 void HTTPClient::ConfigurePut(CURL* curl, const std::string& data) {
-    CheckCurl(curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L));
-    CheckCurl(curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(data.size())));
-    CheckCurl(curl_easy_setopt(curl, CURLOPT_READFUNCTION, ReadCallback));
-    CheckCurl(curl_easy_setopt(curl, CURLOPT_READDATA, &data));
+    CheckCurl(curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT"));
+    CheckCurl(curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, data.size()));
+    CheckCurl(curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.data()));
 }
 
 void HTTPClient::ConfigureDelete(CURL* curl, const std::string& data) {
@@ -646,6 +527,9 @@ void HTTPClient::ConfigurePurge(CURL* curl, const std::string& cacheCluster) {
 
     // Distributed cache headers
     struct curl_slist* headers = nullptr;
+    std::unique_ptr<struct curl_slist, decltype(&curl_slist_free_all)>
+            headers_guard(headers, curl_slist_free_all);
+    
     headers = curl_slist_append(headers, "Cache-Purge: distributed");
     headers = curl_slist_append(headers, ("X-Cache-Cluster: " + cacheCluster).c_str());
 
@@ -656,6 +540,7 @@ void HTTPClient::ConfigurePurge(CURL* curl, const std::string& cacheCluster) {
     // Add current node timestamp
     headers = curl_slist_append(headers, std::string("X-Purge-Timestamp: " + Utilities::getCurrTimeStrWithMilli()).c_str());
 
+    headers_guard.reset(headers);
     CheckCurl(curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers));
 
     // Timeout settings optimized for cluster comms
